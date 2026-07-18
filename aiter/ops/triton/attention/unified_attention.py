@@ -394,6 +394,11 @@ def unified_attention(
         use_gluon_2d = is_2d_gluon_available(
             q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
+        # The gfx1250 Gluon 2d kernel constructs layouts with
+        # gl.arange(0, HEAD_SIZE), which only compiles for power-of-two block
+        # shapes. Kimi-K3 uses a non-power-of-two q head dim, so let the
+        # standard Triton 2d path handle it with HEAD_SIZE_PADDED instead.
+        use_gluon_2d = use_gluon_2d and (head_size & (head_size - 1) == 0)
         if use_gluon_2d:
             _gfx1250_unified_attention_2d(
                 q,
@@ -533,7 +538,16 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
+        use_gluon_3d = (
+            IS_DEVICE_ARCH_GFX12
+            and shuffled_kv_cache
+            and _unified_attention_gluon_kernel_3d is not None
+        )
+        # Like the 2d Gluon path, the gfx1250 3d kernel builds shared layouts
+        # from the real HEAD_SIZE. Non-power-of-two Kimi head dims must use the
+        # standard Triton path, which pads HEAD_SIZE internally.
+        use_gluon_3d = use_gluon_3d and (head_size & (head_size - 1) == 0)
+        if use_gluon_3d:
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -664,8 +678,11 @@ def unified_attention(
             return segm_output, segm_max, segm_expsum
 
         head_size_padded = triton.next_power_of_2(head_size)
-        # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        # Gluon reduce (one workgroup/token, in-wave segment merge); valid for
+        # all-decode with small split counts and power-of-two blocked layouts,
+        # else the Triton reduce_segments path handles the padded shape.
         gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
+        gluon_heads_per_warp = num_query_heads // gluon_num_warps
         use_gluon_reduce = (
             IS_DEVICE_ARCH_GFX12
             and _reduce_segments_gluon is not None
@@ -673,6 +690,8 @@ def unified_attention(
             and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
             and head_size_padded % 32 == 0
             and num_query_heads % gluon_num_warps == 0
+            and (gluon_heads_per_warp & (gluon_heads_per_warp - 1) == 0)
+            and (NUM_SEGMENTS & (NUM_SEGMENTS - 1) == 0)
         )
         if use_gluon_reduce:
             _reduce_segments_gluon[(q.shape[0],)](

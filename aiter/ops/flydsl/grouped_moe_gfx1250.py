@@ -313,6 +313,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     bias2: Optional[torch.Tensor],
     gate_mode: GateMode = GateMode.SEPARATED,
     swiglu_limit: Optional[float] = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -385,8 +387,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not isG1U1 or quant_type != QuantType.per_1x32:
         _grouped_dbg("not g1u1 or not 1x32")
         return None
-    if activation not in (ActivationType.Silu, ActivationType.Swiglu):
-        _grouped_dbg("not silu or not swiglu")
+    if activation not in (
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Situv2,
+    ):
+        _grouped_dbg("not silu, swiglu, or situv2")
         return None
     if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
         _grouped_dbg(f"unsupported gate_mode={gate_mode}")
@@ -830,6 +836,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if data_format == "fp4"
         else compile_moe_grouped_gemm1_a8w4_masked
     )
+    if activation == ActivationType.Swiglu:
+        stage1_act = "swiglu"
+    elif activation == ActivationType.Situv2:
+        stage1_act = "situv2"
+    else:
+        stage1_act = "silu"
     _grouped_dbg("start stage1 compile")
     stage1 = stage1_compiler(
         model_dim=model_dim,
@@ -848,7 +860,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
-        act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        act=stage1_act,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
         stage1_weight_layout=stage1_weight_layout,
         wave_specialized_tdm=(
             stage1_weight_layout == "gugu"

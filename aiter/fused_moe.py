@@ -617,11 +617,9 @@ def fused_moe_(
             else:
                 q_dtype_a = dtypes.fp8
         elif activation == ActivationType.Situv2:
-            # SiTUv2 + separated == a16w4 (bf16 activation x mxfp4 weight); keep
-            # the activation in bf16 (no fp4 quant). a4w4 SiTUv2 full 2-stage is
-            # unsupported (no CK situv2 stage2), so separated-mode SiTUv2 always
-            # maps to the mixed_moe a16w4 kernel.
-            q_dtype_a = dtypes.bf16
+            # Kimi-K3 uses the real a4w4 MoE path: fp4 activation x fp4 weight.
+            # SiTUv2 is handled by the FlyDSL fused activation epilogue.
+            q_dtype_a = dtypes.fp4x2
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -666,6 +664,8 @@ def fused_moe_(
                 bias2=bias2,
                 gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
+                situ_beta=1.0 if beta is None else float(beta),
+                situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             )
 
     if grouped_a8w4_out is not None:
@@ -1911,7 +1911,7 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
@@ -3006,13 +3006,15 @@ def torch_moe_stage1(
             w1 = w1.to(ctype)
         else:
             w1 = fp4_utils.mxfp4_to_f32(w1)
-        w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
+        if w1_scale is not None and w1_scale.dtype == dtypes.fp8_e8m0:
+            w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
         if a1_scale is not None:  # skip a16w4 / mxfp8-bf16-activation ref
             if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
                 hidden_states = hidden_states.to(ctype)
             else:
                 hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
-            a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
+            if a1_scale.dtype == dtypes.fp8_e8m0:
+                a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
         else:  # a16w4 / mxfp8 (bf16 reference activation)
             hidden_states = hidden_states.to(ctype)
     else:
@@ -3136,10 +3138,12 @@ def torch_moe_stage2(
             w2 = w2.to(ctype)
         else:
             w2 = fp4_utils.mxfp4_to_f32(w2)
-        w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
+        if w2_scale is not None and w2_scale.dtype == dtypes.fp8_e8m0:
+            w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
         if a2_scale is not None:
             hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
-            a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
+            if a2_scale.dtype == dtypes.fp8_e8m0:
+                a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
         else:  # a16w4 / mxfp8 (bf16 reference activation)
             hidden_states = hidden_states.to(ctype)
     else:

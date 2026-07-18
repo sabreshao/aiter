@@ -125,6 +125,17 @@ def gemm_a4w4(
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
     k = A.shape[-1] * 2
+    legacy_out_arg = (
+        torch.is_tensor(bias)
+        and bias.ndim >= 2
+        and bias.shape[-1] == n
+        and bias.numel() >= m * n
+    )
+    if legacy_out_arg:
+        # Older ATOM calls gemm_a4w4(A, B, A_scale, B_scale, out). In the newer
+        # aiter signature that positional argument is bias, so normalize it here.
+        bias = None
+        apreshuffle = True
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
         # F4GEMM is kept on a separate dispatch (different kargs layout due to

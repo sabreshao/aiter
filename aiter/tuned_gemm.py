@@ -431,6 +431,10 @@ def skinny_gemm(
     import aiter as ops
 
     assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
+    if solidx == 2 and get_gfx() == "gfx1250":
+        # wv_splitk_small_fp16_bf16 is compiled as UNREACHABLE_CODE outside
+        # MI300/MI350 targets today. Avoid launching that kernel on gfx1250.
+        return F.linear(inp, weights, bias)
     if solidx == 0:
         out = torch.empty(
             inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device

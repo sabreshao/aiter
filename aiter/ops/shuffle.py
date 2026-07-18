@@ -6,6 +6,34 @@ import torch.nn.functional as F
 from aiter.jit.utils.chip_info import get_gfx
 
 
+def interleave_gate_up_rows(src: torch.Tensor) -> torch.Tensor:
+    """Interleave gate/up rows from [g..., u...] to [g0, u0, g1, u1, ...]."""
+    if src.ndim == 2:
+        rows = src.shape[-1]
+        if rows % 2 != 0:
+            raise ValueError(f"gate/up row dimension must be even, got {rows}")
+        return (
+            src.contiguous()
+            .view(*src.shape[:-1], 2, rows // 2)
+            .transpose(-1, -2)
+            .reshape_as(src)
+        )
+
+    if src.ndim < 2:
+        raise ValueError(f"expected at least 2D tensor, got {src.ndim}D")
+
+    rows = src.shape[-2]
+    if rows % 2 != 0:
+        raise ValueError(f"gate/up row dimension must be even, got {rows}")
+    pre_dims = src.ndim - 2
+    return (
+        src.contiguous()
+        .view(*src.shape[:-2], 2, rows // 2, src.shape[-1])
+        .permute(*range(pre_dims), pre_dims + 1, pre_dims, pre_dims + 2)
+        .reshape_as(src)
+    )
+
+
 def _moe_tile_shuffle(
     src: torch.Tensor, tile_minor: int, tile_major: int
 ) -> torch.Tensor:
@@ -213,6 +241,19 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     return shuffle_weight(
         src, layout=(NLane, 16), is_guinterleave=True, gate_up=gate_up
     )
+
+
+def moe_shuffle_weight(
+    src: torch.Tensor,
+    experts_cnt: int = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+) -> torch.Tensor:
+    """Arch-aware MoE weight shuffle wrapper used by ATOM."""
+    del experts_cnt
+    if is_guinterleave:
+        return shuffle_weight_a16w4(src, 16, gate_up)
+    return shuffle_weight(src, layout=(16, 16))
 
 
 def shuffle_weight_NK(
