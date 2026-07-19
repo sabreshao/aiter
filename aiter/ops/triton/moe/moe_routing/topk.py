@@ -205,8 +205,9 @@ def topk(
     assert return_bitmatrix
     assert score_mode in (
         "softmax",
+        "sigmoid",
         "sqrtsoftplus",
-    ), f"score_mode must be 'softmax' or 'sqrtsoftplus', got {score_mode!r}"
+    ), f"score_mode must be 'softmax', 'sigmoid' or 'sqrtsoftplus', got {score_mode!r}"
     if score_mode != "softmax":
         assert not apply_softmax, "apply_softmax only valid with score_mode='softmax'"
     has_bias = bias is not None
@@ -214,9 +215,10 @@ def topk(
         assert bias.dim() == 1
         assert bias.shape[0] == x.shape[-1]
         assert bias.dtype == torch.float32
-        assert (
-            score_mode == "sqrtsoftplus"
-        ), "bias currently only supported with score_mode='sqrtsoftplus'"
+        assert score_mode in (
+            "sqrtsoftplus",
+            "sigmoid",
+        ), "bias only supported with score_mode='sqrtsoftplus' or 'sigmoid'"
     dev = x.device
     # scratchpad tensors
     # NOTE: these are not returned

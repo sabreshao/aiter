@@ -173,27 +173,30 @@ def shuffle_scale_moe(
 ):
     """Arch-aware MoE scale shuffle (a8w4 / a8w8 / a16w4 / a4w4 family).
 
-    gfx950 / gfx1250: preshuffle_factor = 32, scale_kwidth = 8.
-
-    With ``return_layout=True`` also returns the matching ``SWIZZLE_MX_SCALE``
-    label ("GFX1250_SCALE" for gfx1250, "CDNA4_SCALE" for gfx950) as
-    ``(scale, label)``, so callers stay arch-agnostic; otherwise returns just
-    the shuffled scale tensor.
+    Returns the shuffled scale tensor. When ``return_layout=True`` also returns
+    the matching ``SWIZZLE_MX_SCALE`` label ("GFX1250_SCALE" for gfx1250,
+    "CDNA4_SCALE" for gfx950) so callers stay arch-agnostic.
+    gfx950: preshuffle_factor = 32, scale_kwidth = 8
+    gfx1250: preshuffle_factor = 32, scale_kwidth = 8
     """
     arch = arch or get_arch()
-    layout = None
     if arch == "gfx1250":
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
+        out = tiled.transpose(-1, -2)
         layout = "GFX1250_SCALE"
-    elif (arch or get_arch()) == "gfx950":
+    elif arch == "gfx950":
         tiled = _shuffle_scale_tile_gfx950(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
+        out = tiled.transpose(-1, -2)
         layout = "CDNA4_SCALE"
-    scale = tiled.transpose(-1, -2)
-    return (scale, layout) if return_layout else scale
+    else:
+        raise ValueError(f"shuffle_scale_moe: unsupported arch {arch!r}")
+    if return_layout:
+        return out, layout
+    return out
 
 
 # --- batched scales (FP4 blockscale16, attention) ---
