@@ -222,16 +222,20 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
 _is_gfx1250 = _detect_gfx1250()
 _use_vmm = _should_use_vmm(_is_gfx1250)
 
-try:
-    if _is_gfx1250:
-        ops.meta_size_gfx1250()
-    else:
-        ops.meta_size()
-    custom_ar = True
-except Exception as e:
-    # For CPUs
+if os.environ.get("AITER_DISABLE_CUSTOM_ALL_REDUCE", "0") == "1":
     custom_ar = False
-    logger.warning(f"Custom allreduce is disabled: {e}")
+    logger.warning("Custom allreduce is disabled by AITER_DISABLE_CUSTOM_ALL_REDUCE=1")
+else:
+    try:
+        if _is_gfx1250:
+            ops.meta_size_gfx1250()
+        else:
+            ops.meta_size()
+        custom_ar = True
+    except Exception as e:
+        # For CPUs
+        custom_ar = False
+        logger.warning(f"Custom allreduce is disabled: {e}")
 
 
 def is_weak_contiguous(inp: torch.Tensor):

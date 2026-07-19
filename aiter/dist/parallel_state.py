@@ -1083,7 +1083,9 @@ class GroupCoordinator:
         )
 
         if can_use_custom:
-            return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
+            ca_comm = getattr(getattr(self, "device_communicator", None), "ca_comm", None)
+            if ca_comm is not None and not ca_comm.disabled:
+                return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
 
         # NCCL path
         output_tensor = torch.empty(

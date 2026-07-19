@@ -23,6 +23,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 _GROUPED_CONFIG_CACHE = {}
 _WARNED_NAIVE_EPILOGUE = False
+_LOGGED_GROUPED_CONFIG_MISSES = set()
 # Cache the contiguous uint8 view of static MoE weights so a non-contiguous
 # weight is materialized at most once (not re-copied on every fused_moe call).
 _GROUPED_WEIGHT_CACHE = {}
@@ -518,11 +519,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
     else:
-        logger.info(
-            "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
-            "experts=%d topk=%d act=%s dtype=%s q_dtype_a=%s q_dtype_w=%s "
-            "quant_type=%s gate_mode=%s); using defaults tile_m=%d n_warp=%d "
-            "num_buffers=%d split_k1=%d split_k2=%d stage1_weight_layout=%s",
+        config_miss_key = (
             _get_padded_M(token_num),
             model_dim,
             inter_dim,
@@ -541,6 +538,34 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             split_k2,
             stage1_weight_layout,
         )
+        should_log_config_miss = config_miss_key not in _LOGGED_GROUPED_CONFIG_MISSES
+        if should_log_config_miss:
+            if len(_LOGGED_GROUPED_CONFIG_MISSES) >= 1024:
+                _LOGGED_GROUPED_CONFIG_MISSES.clear()
+            _LOGGED_GROUPED_CONFIG_MISSES.add(config_miss_key)
+            logger.info(
+                "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
+                "experts=%d topk=%d act=%s dtype=%s q_dtype_a=%s q_dtype_w=%s "
+                "quant_type=%s gate_mode=%s); using defaults tile_m=%d n_warp=%d "
+                "num_buffers=%d split_k1=%d split_k2=%d stage1_weight_layout=%s",
+                _get_padded_M(token_num),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                activation,
+                dtype,
+                q_dtype_a,
+                q_dtype_w_key,
+                quant_type,
+                gate_mode,
+                tile_m,
+                n_warp,
+                num_buffers,
+                split_k1,
+                split_k2,
+                stage1_weight_layout,
+            )
     # Env vars override the CSV when explicitly set (presence check, so an env
     # value of "0" also overrides a CSV "1").
     if "AITER_GROUPED_GEMM_WAVE_SPECIALIZED" in os.environ:
@@ -999,7 +1024,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _fused_masked_m = None if effective_grouped_contiguous_m else masked_m
         _route_rows = int(token_num) * int(topk)
         _capacity_rows = int(route_E) * int(route_max_m)
-        _fused_topids_to_rows = topids_to_rows if _route_rows < _capacity_rows else None
+        # In contiguous-M mode stage2 consumes whole tiles from grouped_a2. The
+        # route-indexed quant path only writes routed rows, leaving padding rows
+        # inside consumed tiles without valid payload/scale. Quantize the full
+        # contiguous buffer so every row the GEMM may touch is initialized.
+        _fused_topids_to_rows = (
+            None
+            if effective_grouped_contiguous_m
+            else topids_to_rows
+            if _route_rows < _capacity_rows
+            else None
+        )
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
             route_E,

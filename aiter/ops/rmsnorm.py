@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
@@ -11,6 +13,40 @@ from typing import Optional
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
 # shuffle_scale quant and exotic dtypes fall back to module_rmsnorm_quant.
 _DTYPE_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
+
+
+def _use_torch_rmsnorm() -> bool:
+    return os.environ.get("AITER_USE_TORCH_RMSNORM", "0") == "1"
+
+
+def _torch_rms_norm_out(
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    gemma_norm: bool = False,
+) -> None:
+    x = input.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + float(epsilon))
+    w = weight.float()
+    if gemma_norm:
+        w = 1.0 + w
+    out.copy_((x * w).to(dtype=input.dtype))
+
+
+def _torch_add_rms_norm_out(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    gemma_norm: bool = False,
+) -> None:
+    x = input + residual_in
+    residual_out.copy_(x)
+    _torch_rms_norm_out(out, x, weight, epsilon, gemma_norm)
 
 
 # Raw C ABI (ctypes): pointers/dims/stream as int64; validated in the wrappers below.
@@ -86,6 +122,10 @@ def rms_norm_opus(
     gemma_norm: bool = False,
 ) -> None:
     """out = rmsnorm(input) * (weight [+ 1 if gemma_norm]) (fp32 accumulate)."""
+    if _use_torch_rmsnorm():
+        _torch_rms_norm_out(out, input, weight, epsilon, gemma_norm)
+        return
+
     hidden = input.shape[-1]
     # The kernel takes a row stride, so a 2-D row-strided view (e.g. a torch.split slice)
     # needs no copy; anything else non-contiguous is materialized.
@@ -120,6 +160,12 @@ def fused_add_rms_norm_opus(
     gemma_norm: bool = False,
 ) -> None:
     """In place: x = input + residual; residual = x; input = rmsnorm(x) * (weight [+1])."""
+    if _use_torch_rmsnorm():
+        _torch_add_rms_norm_out(
+            input, input, residual, residual, weight, epsilon, gemma_norm
+        )
+        return
+
     _check(input, weight)
     assert residual.dtype == input.dtype and residual.is_contiguous(), "bad residual"
     assert residual.numel() == input.numel(), "residual shape != input"
@@ -163,6 +209,12 @@ def rmsnorm2d_fwd_with_add_opus(
     Single out-of-place kernel pass (no host staging copies) -- the per-layer residual-add
     path vLLM/SGLang/ATOM call, so staging copies were a ~2x regression.
     """
+    if _use_torch_rmsnorm():
+        _torch_add_rms_norm_out(
+            out, input, residual_in, residual_out, weight, epsilon, gemma_norm
+        )
+        return
+
     hidden = input.shape[-1]
     # kernel takes an input row stride; only a non-unit last-dim stride needs materializing.
     if input.stride(-1) != 1:
@@ -386,6 +438,10 @@ def _rms_norm_fwd_fake(
 
 
 def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
+    if _use_torch_rmsnorm():
+        return False
+    if os.environ.get("AITER_USE_OPUS_RMSNORM", "0") == "1":
+        return False
     # main routed the bf16/fp16, hidden<=8192, non-T5, 2-D case to the hand-tuned HIP
     # module_rmsnorm_quant (add_rmsnorm_quant_kernel); opus handles the rest (fp32, T5,
     # hidden>8192, non-2-D) that the CK module_rmsnorm used to cover. Keeping the hot path

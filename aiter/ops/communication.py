@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from typing import Optional
 
 # from ..dist.utils import get_open_port, get_distributed_init_method, get_ip
@@ -39,7 +40,8 @@ def init_dist_env(
         * tensor_model_parallel_size
         * prefill_context_model_parallel_size
     )
-    set_custom_all_reduce(True)
+    enable_custom_all_reduce = os.environ.get("AITER_DISABLE_CUSTOM_ALL_REDUCE", "0") != "1"
+    set_custom_all_reduce(enable_custom_all_reduce)
     init_distributed_environment(
         world_size=world_size,
         rank=rankID,
@@ -58,10 +60,13 @@ def init_dist_env(
         prefill_context_model_parallel_size=prefill_context_model_parallel_size,
     )
 
-    if tensor_model_parallel_size > 1:
+    if tensor_model_parallel_size > 1 and enable_custom_all_reduce:
         # hack custom_allreduce
         tp_grp = get_tp_group()
         ca_comm = tp_grp.device_communicator.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            logger.warning("Custom allreduce signal buffer registration skipped.")
+            return
         # gfx1250 (MI450) uses a VMM-based custom allreduce whose input buffer
         # is already registered in CustomAllreduce._init_gfx1250(). The extra
         # register_input_buffer(signal) below routes through get_external_ipc_meta,
@@ -69,7 +74,7 @@ def init_dist_env(
         # so it can never align across TP ranks and deadlocks at startup. The
         # `signal`/`buffer` attributes set here are never read anywhere, so skip
         # the whole block on gfx1250.
-        if ca_comm is not None and not getattr(ca_comm, "_is_gfx1250", False):
+        if not getattr(ca_comm, "_is_gfx1250", False):
             # signal
             signal = torch.zeros(
                 tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID

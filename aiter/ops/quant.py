@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 if TYPE_CHECKING:
@@ -366,6 +367,8 @@ def get_torch_quant(qType):
 
 @functools.lru_cache()
 def get_hip_quant(qType):
+    if os.environ.get("AITER_USE_TRITON_QUANT", "0") == "1":
+        return get_triton_quant(qType)
     # `per_1x32` points to the dtype-aware MX entry so callers can do
     # `get_hip_quant(QuantType.per_1x32)(x, quant_dtype=dtypes.fp4x2)` for
     # MXFP4 or `quant_dtype=dtypes.fp8` for MXFP8. The legacy

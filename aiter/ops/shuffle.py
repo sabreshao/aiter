@@ -9,15 +9,11 @@ from aiter.jit.utils.chip_info import get_gfx
 def interleave_gate_up_rows(src: torch.Tensor) -> torch.Tensor:
     """Interleave gate/up rows from [g..., u...] to [g0, u0, g1, u1, ...]."""
     if src.ndim == 2:
-        rows = src.shape[-1]
+        rows = src.shape[0]
         if rows % 2 != 0:
             raise ValueError(f"gate/up row dimension must be even, got {rows}")
-        return (
-            src.contiguous()
-            .view(*src.shape[:-1], 2, rows // 2)
-            .transpose(-1, -2)
-            .reshape_as(src)
-        )
+        inter = rows // 2
+        return torch.stack([src[:inter], src[inter:]], dim=1).flatten(0, 1).contiguous()
 
     if src.ndim < 2:
         raise ValueError(f"expected at least 2D tensor, got {src.ndim}D")
@@ -248,12 +244,17 @@ def moe_shuffle_weight(
     experts_cnt: int = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
+    layout=(16, 16),
 ) -> torch.Tensor:
     """Arch-aware MoE weight shuffle wrapper used by ATOM."""
     del experts_cnt
-    if is_guinterleave:
-        return shuffle_weight_a16w4(src, 16, gate_up)
-    return shuffle_weight(src, layout=(16, 16))
+    if get_gfx() == "gfx1250":
+        if is_guinterleave and gate_up:
+            src = interleave_gate_up_rows(src)
+        return shuffle_weight(src, layout=layout)
+    return shuffle_weight(
+        src, layout=layout, is_guinterleave=is_guinterleave, gate_up=gate_up
+    )
 
 
 def shuffle_weight_NK(

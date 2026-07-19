@@ -66,6 +66,7 @@ except Exception:
 # one-time warm.)
 _OPUS_WS_ARCHS = {"gfx950", "gfx942", "gfx1250"}
 _opus_ws_warmed_sigs = set()
+_LOGGED_GEMM_CONFIG_MISSES = set()
 
 
 @functools.lru_cache(maxsize=1)
@@ -290,9 +291,25 @@ def get_GEMM_A16W16_config(
         if not default_config:
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
+        config_miss_key = (
+            M,
+            N,
+            K,
+            dtype,
+            otype,
+            bias,
+            scaleAB,
+            bpreshuffle,
+            default_config["libtype"],
+            default_config["solidx"],
         )
+        if config_miss_key not in _LOGGED_GEMM_CONFIG_MISSES:
+            if len(_LOGGED_GEMM_CONFIG_MISSES) >= 1024:
+                _LOGGED_GEMM_CONFIG_MISSES.clear()
+            _LOGGED_GEMM_CONFIG_MISSES.add(config_miss_key)
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
+            )
         return default_config
 
     return config
