@@ -601,8 +601,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
     # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
+    #
+    # gfx1250 bug: the contiguous-M scheduler illegal-memory-faults in the stage2
+    # fused-quant preshuffle when a large batch routes across many experts with
+    # uneven per-expert counts (real spread routing). The non-contiguous path is
+    # correct there, so default the auto-enable threshold to effectively infinite
+    # on gfx1250 (contiguous-M stays off unless explicitly forced via
+    # AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or an explicit token threshold env).
+    _is_gfx1250 = get_gfx() == "gfx1250"
+    _default_contig_threshold = (1 << 62) if _is_gfx1250 else 16
     _contig_token_threshold = _as_int(
-        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 16
+        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"),
+        _default_contig_threshold,
     )
     if token_num > _contig_token_threshold:
         grouped_contiguous_m = True
