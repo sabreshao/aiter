@@ -137,9 +137,21 @@ def kernel_unified_attention_2d(
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
-    offs_shfl = None
+    # Pre-shuffled KV cache index grids (see the K/V load in the tile loop).
+    # TILE_SIZE == BLOCK_SIZE in the shuffled path, and:
+    #   K cache: [num_blks, num_kv_heads, HEAD_SIZE // K_WIDTH, TILE_SIZE, K_WIDTH]
+    #   V cache: [num_blks, num_kv_heads, TILE_SIZE // K_WIDTH, HEAD_SIZE, K_WIDTH]
+    shfl_w = None
+    shfl_kt = None
+    shfl_kg = None
+    shfl_vt = None
+    shfl_vd = None
     if SHUFFLED_KV_CACHE:
-        offs_shfl = tl.arange(0, TILE_SIZE * HEAD_SIZE_PADDED)
+        shfl_w = tl.arange(0, K_WIDTH)
+        shfl_kt = tl.arange(0, TILE_SIZE)
+        shfl_kg = tl.arange(0, HEAD_SIZE_PADDED // K_WIDTH)
+        shfl_vt = tl.arange(0, TILE_SIZE // K_WIDTH)
+        shfl_vd = tl.arange(0, HEAD_SIZE_PADDED)
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
@@ -272,17 +284,33 @@ def kernel_unified_attention_2d(
             physical_block_idx_shfl = tl.load(
                 block_tables_ptr + block_table_offset + j
             ).to(tl.int64)
+            # Address with the real cache strides instead of a flat
+            # HEAD_SIZE_PADDED span: for K the head dim is d = shfl_kg*K_WIDTH +
+            # shfl_w, for V the token is t = shfl_vt*K_WIDTH + shfl_w. A
+            # non-power-of-two head (HEAD_SIZE_PADDED != HEAD_SIZE) then needs a
+            # HEAD_SIZE validity mask so K does not over-read into the next head
+            # and V uses the true HEAD_SIZE token-group stride; power-of-two
+            # heads reproduce the original contiguous addresses with no mask.
             k_offset = (
                 physical_block_idx_shfl * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_1
-                + offs_shfl
+                + shfl_kg[:, None, None] * stride_k_cache_2
+                + shfl_kt[None, :, None] * stride_k_cache_3
+                + shfl_w[None, None, :]
             )
-
             v_offset = (
                 physical_block_idx_shfl * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_1
-                + offs_shfl
+                + shfl_vt[:, None, None] * stride_v_cache_2
+                + shfl_vd[None, :, None] * stride_v_cache_3
+                + shfl_w[None, None, :]
             )
+            if HEAD_SIZE_PADDED != HEAD_SIZE:
+                k_mask = (
+                    shfl_kg[:, None, None] * K_WIDTH + shfl_w[None, None, :]
+                ) < HEAD_SIZE
+                v_mask = shfl_vd[None, :, None] < HEAD_SIZE
+                other = 0.0
         else:
             physical_block_idx = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -315,13 +343,9 @@ def kernel_unified_attention_2d(
 
         K = K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
+            # [HEAD_SIZE_PADDED // K_WIDTH, TILE_SIZE, K_WIDTH] -> [HEAD_SIZE_PADDED, TILE_SIZE]
             K = (
-                K.reshape(
-                    HEAD_SIZE_PADDED // K_WIDTH,
-                    TILE_SIZE,
-                    K_WIDTH,
-                )
-                .permute(1, 0, 2)
+                K.permute(1, 0, 2)
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
                 .trans(1, 0)
             )
@@ -336,13 +360,9 @@ def kernel_unified_attention_2d(
 
         V = V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
+            # [TILE_SIZE // K_WIDTH, HEAD_SIZE_PADDED, K_WIDTH] -> [TILE_SIZE, HEAD_SIZE_PADDED]
             V = (
-                V.reshape(
-                    TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
-                    K_WIDTH,
-                )
-                .permute(0, 2, 1)
+                V.permute(0, 2, 1)
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
@@ -558,9 +578,21 @@ def kernel_unified_attention_3d(
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
 
-    offs_shfl = None
+    # Pre-shuffled KV cache index grids (see the K/V load in the tile loop).
+    # TILE_SIZE == BLOCK_SIZE in the shuffled path, and:
+    #   K cache: [num_blks, num_kv_heads, HEAD_SIZE // K_WIDTH, TILE_SIZE, K_WIDTH]
+    #   V cache: [num_blks, num_kv_heads, TILE_SIZE // K_WIDTH, HEAD_SIZE, K_WIDTH]
+    shfl_w = None
+    shfl_kt = None
+    shfl_kg = None
+    shfl_vt = None
+    shfl_vd = None
     if SHUFFLED_KV_CACHE:
-        offs_shfl = tl.arange(0, TILE_SIZE * HEAD_SIZE_PADDED)
+        shfl_w = tl.arange(0, K_WIDTH)
+        shfl_kt = tl.arange(0, TILE_SIZE)
+        shfl_kg = tl.arange(0, HEAD_SIZE_PADDED // K_WIDTH)
+        shfl_vt = tl.arange(0, TILE_SIZE // K_WIDTH)
+        shfl_vd = tl.arange(0, HEAD_SIZE_PADDED)
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
@@ -678,17 +710,33 @@ def kernel_unified_attention_3d(
             physical_block_idx_shfl = tl.load(
                 block_tables_ptr + block_table_offset + j
             ).to(tl.int64)
+            # Address with the real cache strides instead of a flat
+            # HEAD_SIZE_PADDED span: for K the head dim is d = shfl_kg*K_WIDTH +
+            # shfl_w, for V the token is t = shfl_vt*K_WIDTH + shfl_w. A
+            # non-power-of-two head (HEAD_SIZE_PADDED != HEAD_SIZE) then needs a
+            # HEAD_SIZE validity mask so K does not over-read into the next head
+            # and V uses the true HEAD_SIZE token-group stride; power-of-two
+            # heads reproduce the original contiguous addresses with no mask.
             k_offset = (
                 physical_block_idx_shfl * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_1
-                + offs_shfl
+                + shfl_kg[:, None, None] * stride_k_cache_2
+                + shfl_kt[None, :, None] * stride_k_cache_3
+                + shfl_w[None, None, :]
             )
-
             v_offset = (
                 physical_block_idx_shfl * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_1
-                + offs_shfl
+                + shfl_vt[:, None, None] * stride_v_cache_2
+                + shfl_vd[None, :, None] * stride_v_cache_3
+                + shfl_w[None, None, :]
             )
+            if HEAD_SIZE_PADDED != HEAD_SIZE:
+                k_mask = (
+                    shfl_kg[:, None, None] * K_WIDTH + shfl_w[None, None, :]
+                ) < HEAD_SIZE
+                v_mask = shfl_vd[None, :, None] < HEAD_SIZE
+                other = 0.0
         else:
             physical_block_idx = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
@@ -721,13 +769,9 @@ def kernel_unified_attention_3d(
 
         K = K_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
+            # [HEAD_SIZE_PADDED // K_WIDTH, TILE_SIZE, K_WIDTH] -> [HEAD_SIZE_PADDED, TILE_SIZE]
             K = (
-                K.reshape(
-                    HEAD_SIZE_PADDED // K_WIDTH,
-                    TILE_SIZE,
-                    K_WIDTH,
-                )
-                .permute(1, 0, 2)
+                K.permute(1, 0, 2)
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
                 .trans(1, 0)
             )
@@ -742,13 +786,9 @@ def kernel_unified_attention_3d(
 
         V = V_load.to(Q.dtype)
         if SHUFFLED_KV_CACHE:
+            # [TILE_SIZE // K_WIDTH, HEAD_SIZE_PADDED, K_WIDTH] -> [TILE_SIZE, HEAD_SIZE_PADDED]
             V = (
-                V.reshape(
-                    TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
-                    K_WIDTH,
-                )
-                .permute(0, 2, 1)
+                V.permute(0, 2, 1)
                 .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
             )
 
