@@ -264,7 +264,6 @@ def use_2d_kernel(
     max_seqlen_k,
     target_num_prgms,
     num_2d_prgms,
-    shuffled_kv_cache=False,
 ):
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
@@ -388,7 +387,6 @@ def unified_attention(
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
-        shuffled_kv_cache,
     ):
 
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
@@ -398,8 +396,8 @@ def unified_attention(
         )
         # The gfx1250 Gluon 2d kernel constructs layouts with
         # gl.arange(0, HEAD_SIZE), which only compiles for power-of-two block
-        # shapes. A non-power-of-two head dim must use the standard Triton 2d
-        # path instead, which handles it with HEAD_SIZE_PADDED.
+        # shapes. Kimi-K3 uses a non-power-of-two q head dim, so let the
+        # standard Triton 2d path handle it with HEAD_SIZE_PADDED instead.
         use_gluon_2d = use_gluon_2d and (head_size & (head_size - 1) == 0)
         if use_gluon_2d:
             _gfx1250_unified_attention_2d(
@@ -546,7 +544,7 @@ def unified_attention(
             and _unified_attention_gluon_kernel_3d is not None
         )
         # Like the 2d Gluon path, the gfx1250 3d kernel builds shared layouts
-        # from the real HEAD_SIZE. Non-power-of-two head dims must use the
+        # from the real HEAD_SIZE. Non-power-of-two Kimi head dims must use the
         # standard Triton path, which pads HEAD_SIZE internally.
         use_gluon_3d = use_gluon_3d and (head_size & (head_size - 1) == 0)
         if use_gluon_3d:
