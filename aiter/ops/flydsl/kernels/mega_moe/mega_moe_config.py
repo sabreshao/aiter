@@ -49,6 +49,35 @@ KIMI_K3_EXPERTS_PER_RANK = 112
 R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
 V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
 K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
+# Kimi-K2.6: 384 experts (48 per rank at EP8), top-8, R1's 7168x2048 shape.
+KIMI_K26_EXPERTS_PER_RANK = 48
+K26_MODEL_DIM, K26_INTER_DIM = 7168, 2048
+# DeepSeek-V4.1-Flash: 384 experts (48 per rank at EP8), top-6, 5120x2304, SwiGLU clamp 10.
+V41F_MODEL_DIM, V41F_INTER_DIM = 5120, 2304
+# (model_dim, inter_dim, experts, topk, swiglu_limit) of the EP8 a8w4 SiLU layouts
+# the fused small- and large-input paths support: DeepSeek-V4-Pro, Kimi-K2.6,
+# DeepSeek-V4.1-Flash.
+FUSED_PATH_SHAPES = (
+    (V4_MODEL_DIM, V4_INTER_DIM, 384, 6, 10.0),
+    (K26_MODEL_DIM, K26_INTER_DIM, 384, 8, 0.0),
+    (V41F_MODEL_DIM, V41F_INTER_DIM, 384, 6, 10.0),
+)
+# DeepSeek-V4.1-Flash's DSpark draft MoE layers: 128 experts (16 per rank at EP8), top-3, the main model's
+# 5120x2304 expert shape and SwiGLU clamp. The small-input path only (its draft steps stay in decode sizes).
+V41F_DRAFT_SHAPE = (V41F_MODEL_DIM, V41F_INTER_DIM, 128, 3, 10.0)
+SMALL_M_SHAPES = FUSED_PATH_SHAPES + (V41F_DRAFT_SHAPE,)
+# Max tokens per rank of the large-input path: 8192 for every FUSED_PATH_SHAPES layout; V4.1-Flash also
+# runs it at 16384 (vLLM's 16384-token chunks reach past 8192 tokens a rank in most prefill steps).
+LARGE_M_MTPR_SHAPES = {
+    8192: FUSED_PATH_SHAPES,
+    16384: ((V41F_MODEL_DIM, V41F_INTER_DIM, 384, 6, 10.0),),
+}
+
+
+def large_m_shape_supported(max_tok_per_rank, model_dim, inter_dim, experts, topk, swiglu_limit) -> bool:
+    """Whether the large-input path supports this (max tokens per rank, layout)."""
+    shape = (int(model_dim), int(inter_dim), int(experts), int(topk), float(swiglu_limit))
+    return shape in LARGE_M_MTPR_SHAPES.get(int(max_tok_per_rank), ())
 # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
 # prelude but have no per-bucket tuner of their own.
 V4_EPLB_EXPERTS_PER_RANKS = (52, 56)
@@ -770,6 +799,27 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     return config
 
 
+def _tune_kimi_k26(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+    """Kimi-K2.6 (48 experts per rank, 7168x2048, top-8) A8W4: the base config, except
+    the 16K / 32K buckets of the large-MTPR class (above the large-input path's 8192
+    tokens a rank), whose Stage2 runs the deep pipeline with a wider skew cohort."""
+    if (
+        ctx.a_dtype == ACTIVATION_FP8
+        and ctx.mtpr_class == MAX_MTPR_CLASS
+        and ctx.bucket in (16384, 32768)
+    ):
+        config = _replace_config(
+            config,
+            stage2={
+                "persist_cu": 224,
+                "skew_cu": 224,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+            },
+        )
+    return config
+
+
 def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     """DeepSeek-V4.1-Flash at EP2 (192 experts per rank), the two buckets swept
     on gfx950 (bench_mega_moe_v2, 384 and 16384 source tokens a rank): SBM32
@@ -863,6 +913,13 @@ _NETWORKS = (
     ),
     NetworkProfile(
         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
+    ),
+    NetworkProfile(
+        "kimi_k26",
+        KIMI_K26_EXPERTS_PER_RANK,
+        K26_MODEL_DIM,
+        K26_INTER_DIM,
+        _tune_kimi_k26,
     ),
     NetworkProfile(
         "v41_flash_ep2",

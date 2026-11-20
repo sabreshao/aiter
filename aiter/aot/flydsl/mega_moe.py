@@ -19,13 +19,13 @@ the MoE replay this one runs in a process of its own, started with
 ``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
 ``GPU_ARCHS`` names targets without gfx950.
 
-The MTPR 8192 jobs build the instance with the opt-in small- and large-input
+The MTPR 8192 and 16384 jobs build the instance with the opt-in small- and large-input
 paths turned on (``AITER_MEGA_SMALL_M`` / ``AITER_MEGA_LARGE_M``), so the
 profiles those paths support also get their kernels; the runtime's own
 eligibility checks decide which profiles that is.
 
 Usage:
-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, Kimi-K2.6, V4.1-Flash)
     python -m aiter.aot.flydsl.mega_moe
 
     # One custom profile
@@ -79,13 +79,30 @@ K3_INTER_DIM = 3072
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
+# Kimi-K2.6 deployment profile (EP8 / epr48, topk8, d7168 / i2048, SiLU without a
+# SwiGLU clamp), a8w4 only.
+K26_EXPERTS_PER_RANKS = (48,)
+K26_TOPK = 8
+K26_MODEL_DIM = 7168
+K26_INTER_DIM = 2048
+K26_QUANTS = ("a8w4",)
+# DeepSeek-V4.1-Flash deployment profile (EP8 / epr48, topk6, d5120 / i2304, SwiGLU
+# clamp 10), a8w4 only. vLLM serves it from MTPR 16384 instances with the small- and
+# large-input paths on, so AOT keeps their kernels out of the first serving steps.
+V41F_EXPERTS_PER_RANKS = (48,)
+V41F_TOPK = 6
+V41F_MODEL_DIM = 5120
+V41F_INTER_DIM = 2304
+V41F_QUANTS = ("a8w4",)
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
 INTER_DIM = 3072
 SWIGLU_LIMIT = 10.0
-# Instances of this MTPR also build the opt-in small- and large-input paths.
-FUSED_PATHS_MTPR = 8192
+# Instances of these MTPRs also build the opt-in small- and large-input paths (the
+# runtime's eligibility checks decide which profiles get them: large-input at 16384
+# is DeepSeek-V4.1-Flash only).
+FUSED_PATHS_MTPRS = (8192, 16384)
 FUSED_PATHS_ENV = {"AITER_MEGA_SMALL_M": "1", "AITER_MEGA_LARGE_M": "1"}
 
 
@@ -147,9 +164,10 @@ def production_jobs(
     world_size=WORLD_SIZE,
     swiglu_limit=SWIGLU_LIMIT,
 ):
-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3,
+    Kimi-K2.6 and DeepSeek-V4.1-Flash.
 
-    Used by the default build so both profiles are AOT-covered and neither
+    Used by the default build so every profile is AOT-covered and none
     triggers an online JIT compile at serving time.
     """
     jobs = default_jobs(
@@ -167,6 +185,26 @@ def production_jobs(
         act=K3_ACT,
         situ_beta=K3_SITU_BETA,
         situ_linear_beta=K3_SITU_LINEAR_BETA,
+    )
+    jobs += default_jobs(
+        mtprs,
+        K26_EXPERTS_PER_RANKS,
+        quants=tuple(q for q in quants if q in K26_QUANTS),
+        world_size=world_size,
+        topk=K26_TOPK,
+        model_dim=K26_MODEL_DIM,
+        inter_dim=K26_INTER_DIM,
+        swiglu_limit=0.0,
+    )
+    jobs += default_jobs(
+        mtprs,
+        V41F_EXPERTS_PER_RANKS,
+        quants=tuple(q for q in quants if q in V41F_QUANTS),
+        world_size=world_size,
+        topk=V41F_TOPK,
+        model_dim=V41F_MODEL_DIM,
+        inter_dim=V41F_INTER_DIM,
+        swiglu_limit=swiglu_limit,
     )
     return jobs
 
@@ -236,7 +274,7 @@ def compile_one_config(**job):
     started = time.time()
     try:
         device = torch.device("cuda", job["rank"])
-        fused_paths = FUSED_PATHS_ENV if job["mtpr"] == FUSED_PATHS_MTPR else {}
+        fused_paths = FUSED_PATHS_ENV if job["mtpr"] in FUSED_PATHS_MTPRS else {}
         with (
             mock.patch.dict(os.environ, fused_paths),
             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),

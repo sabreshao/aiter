@@ -19,6 +19,8 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
+    SMALL_M_SHAPES,
+    large_m_shape_supported,
     INDEXED_PAYLOAD_MIN_MTPR,
     MegaMoEConfig,
     Stage1Config,
@@ -58,19 +60,15 @@ def large_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
+    """Whether the large-input path supports this layout (EP8 a8w4, LARGE_M_MTPR_SHAPES)."""
     return (
         enabled
         and arch.split(":", 1)[0] == "gfx950"
         and world_size == 8
-        and model_dim == 7168
-        and inter_dim == 3072
-        and experts == 384
-        and experts // world_size == 48
-        and topk == 6
+        and large_m_shape_supported(
+            max_tok_per_rank, model_dim, inter_dim, experts, topk, swiglu_limit
+        )
         and quant == "a8w4"
-        and max_tok_per_rank == 8192
-        and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks
     )
@@ -91,27 +89,31 @@ def small_m_eligible(
     fanout_masks: tuple[int, ...] = (),
     act: str = "silu",
 ) -> bool:
-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 / V4.1-Flash a8w4).
+    """Whether the small-input path supports this layout (EP8 a8w4, SMALL_M_SHAPES).
 
     The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
     (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
-    V4.1-Flash (5120 / 2304) uses the default small-input config unchanged; it
-    was checked against an FP32 reference and against the main path on 8x MI355X.
-    Any 1..64 experts per rank (one plan lane per local expert) and top-1..8 are
-    supported: the routed 384 / top-6 MoE, vLLM's fuse_shared_expert layout of it
-    (392 / top-7) and the DSpark draft MoE (128 / top-3) were checked the same way.
+    Besides SMALL_M_SHAPES, the V4 / V4.1-Flash dims (7168 / 3072, 5120 / 2304) with SwiGLU clamp 10 take any
+    1..64 experts per rank (one plan lane per local expert) and top-1..8: vLLM's fuse_shared_expert layout of the
+    routed MoE (392 / top-7) and the DSpark draft MoE (128 / top-3) were checked against an FP32 reference and the
+    main path on 8x MI355X.
     """
     return (
         enabled
         and arch.split(":", 1)[0] == "gfx950"
         and num_cu == 256
         and world_size == 8
-        and (model_dim, inter_dim) in ((7168, 3072), (5120, 2304))
-        and experts % world_size == 0
-        and 1 <= experts // world_size <= 64
-        and 1 <= topk <= 8
+        and (
+            (model_dim, inter_dim, experts, topk, float(swiglu_limit)) in SMALL_M_SHAPES
+            or (
+                (model_dim, inter_dim) in ((7168, 3072), (5120, 2304))
+                and float(swiglu_limit) == 10.0
+                and experts % world_size == 0
+                and 1 <= experts // world_size <= 64
+                and 1 <= topk <= 8
+            )
+        )
         and quant == "a8w4"
-        and swiglu_limit == 10.0
         and act == "silu"
         and not fanout_masks
     )

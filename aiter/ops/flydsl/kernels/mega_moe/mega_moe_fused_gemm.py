@@ -52,8 +52,9 @@ TOKEN_BUCKETS = (
 )
 # The small-input single kernel keeps fixed slots up to this MTPR (past it the main path is faster).
 SMALL_M_FIXED_SLOT_MAX_MTPR = 512
-# The large-input path runs on an instance of this MTPR only.
+# The large-input path runs on instances of these MTPRs (mega_moe_config.LARGE_M_MTPR_SHAPES gates the layouts).
 LARGE_M_MTPR = 8192
+LARGE_M_MTPRS = (8192, 16384)
 REFERENCE_EXPERTS_PER_RANK = 48
 EXPERT_CONFIG_GRANULARITY = 64
 
@@ -149,11 +150,16 @@ def _fixed_dispatch_cu(bucket: int) -> int:
     return min(224, 16 * (bucket.bit_length() + 7))
 
 
-def _select_fixed_stage1(bucket: int, experts_per_rank: int) -> Stage1Config:
+def _select_fixed_stage1(
+    bucket: int, experts_per_rank: int, inter_dim: int
+) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
+    # The small-input kernel cuts its XCD slices on groups of 4 n-tiles, so a tile_n must give
+    # a multiple of 4 n-tiles: V4.1-Flash's 2 x 2304 takes 128 (36 tiles) where 256 gives 18.
+    tile_n = 256 if bucket <= 8 and (2 * inter_dim // 256) % 4 == 0 else 128
     return Stage1Config(
         sort_block_m=32,
-        tile_n=256 if bucket <= 8 else 128,
+        tile_n=tile_n,
         num_waves=4,
         grid_mult=grid_mult,
         num_dispatch_cu=_scale_dispatch_cu(
@@ -190,7 +196,9 @@ def _large_config(
         tile_n=512 if inter_dim >= 2048 else 256,
         num_waves=8,
         grid_mult=1,
-        num_dispatch_cu=_scale_dispatch_cu(96, experts_per_rank),
+        # Payload helper CTAs (mega_moe_large_m.LARGE_M_DISPATCH) share the dispatch, so fewer
+        # producers leave more CTAs to GEMM1.
+        num_dispatch_cu=_scale_dispatch_cu(48, experts_per_rank),
         mfma_amajor=True,
         async_a_copy=True,
         use_tile_resource=True,
@@ -213,9 +221,9 @@ def _large_config(
 def _select_config(
     bucket: int, mtpr: int, experts_per_rank: int, model_dim: int, inter_dim: int
 ) -> MegaMoEConfig:
-    if mtpr == LARGE_M_MTPR:
+    if mtpr in LARGE_M_MTPRS:
         return _large_config(experts_per_rank, model_dim, inter_dim)
-    stage1 = _select_fixed_stage1(bucket, experts_per_rank)
+    stage1 = _select_fixed_stage1(bucket, experts_per_rank, inter_dim)
     stage2 = _select_fixed_stage2(bucket, model_dim)
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
@@ -228,10 +236,10 @@ def select_mega_moe_config(
     model_dim: int = 7168,
     inter_dim: int = 3072,
 ) -> MegaMoEConfig:
-    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR 8192) config for ``tokens`` per rank."""
+    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR 8192 / 16384) config for ``tokens`` per rank."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-    if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr != LARGE_M_MTPR:
+    if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
     if tokens > mtpr:
         raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
