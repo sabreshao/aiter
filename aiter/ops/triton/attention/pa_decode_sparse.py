@@ -754,6 +754,7 @@ def _pa_decode_sparse_gfx950_gluon(
     inv_rope_cos_sin_cache=None,
     out_mxfp8=None,
     extra_scrub_nan=False,
+    _block_m=None,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
     3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -902,6 +903,8 @@ def _pa_decode_sparse_gfx950_gluon(
             )
         elif staged_bf16:
             BLOCK_M = _staged_block_m(num_heads, num_queries, num_splits, row_tiles)
+    if _block_m is not None:
+        BLOCK_M = _block_m
     if BLOCK_M > 16:
         num_warps = 8
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
@@ -916,6 +919,53 @@ def _pa_decode_sparse_gfx950_gluon(
     else:
         out_scale = None
         out = _check_out(out, q, torch.bfloat16)
+    # Row split for fp8_dsv4_mla at 64 heads. One 64-head program per row is
+    # cheaper per row than two 32-head programs (they gather and dequant the same
+    # keys twice), but at 1 program per CU a row count just past whole rounds
+    # (e.g. 384 rows on 256 CUs) leaves 64-head programs a half-empty last round.
+    # So run the whole rounds of rows as 64-head programs and the remainder (at
+    # most half a round of rows) as 32-head programs: two launches over views,
+    # same shapes on every replay, no host sync.
+    num_sms = get_num_sms()
+    rem_rows = num_queries % num_sms
+    if (
+        _block_m is None
+        and packed_fp8
+        and num_heads == 64
+        and BLOCK_M == 32
+        and num_splits == 1
+        and kv_splits is None
+        and not skip_reduce
+        and not prefill
+        and num_queries > num_sms
+        and 0 < 2 * rem_rows <= num_sms
+    ):
+        full_rows = num_queries - rem_rows
+        for lo, hi, bm in ((0, full_rows, 64), (full_rows, num_queries, 32)):
+            _pa_decode_sparse_gfx950_gluon(
+                q[lo:hi],
+                cache,
+                cache_scales,
+                indices,
+                indptr[lo : hi + 1],
+                scale,
+                attn_sink if has_sink else None,
+                extra_cache if has_extra else None,
+                extra_indices if has_extra else None,
+                extra_indptr[lo : hi + 1] if has_extra else None,
+                out=None if out_scale is not None else out[lo:hi],
+                has_invalid=has_invalid,
+                inv_rope_positions=inv_rope_positions[lo:hi] if inv_rope else None,
+                inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+                out_mxfp8=(
+                    (out_data[lo:hi], out_scale[lo:hi])
+                    if out_scale is not None
+                    else None
+                ),
+                extra_scrub_nan=extra_scrub_nan,
+                _block_m=bm,
+            )
+        return out
     epilogue = {
         "pos_ptr": inv_rope_positions,
         "cos_sin_ptr": inv_rope_cos_sin_cache,
